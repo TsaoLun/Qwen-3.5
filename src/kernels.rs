@@ -497,6 +497,33 @@ fn rmsnorm_kernel(
     }
 }
 
+/// Single-token depthwise conv, kernel 4, then SiLU. State is `[channels, 3]`.
+#[cube(launch)]
+fn depthwise_conv_silu_kernel(
+    input: &Tensor<f32>,         // [channels]
+    state: &Tensor<f32>,         // [channels, 3]
+    weight: &Tensor<f32>,        // [channels, 4]
+    out: &mut Tensor<f32>,       // [channels]
+    new_state: &mut Tensor<f32>, // [channels, 3]
+    channels: u32,
+) {
+    let c = usize::cast_from(ABSOLUTE_POS);
+    if c < usize::cast_from(channels) {
+        let s0 = state[c * 3];
+        let s1 = state[c * 3 + 1];
+        let s2 = state[c * 3 + 2];
+        let x = input[c];
+        let y = weight[c * 4] * s0
+            + weight[c * 4 + 1] * s1
+            + weight[c * 4 + 2] * s2
+            + weight[c * 4 + 3] * x;
+        out[c] = y / (1.0 + (-y).exp());
+        new_state[c * 3] = s1;
+        new_state[c * 3 + 1] = s2;
+        new_state[c * 3 + 2] = x;
+    }
+}
+
 /// One Gated Delta Rule step for a single token.
 ///
 /// One cube per head, one unit per value column. `k_dim` must equal `v_dim` and be a power of two.
@@ -647,6 +674,19 @@ pub trait CustomKernels: Backend {
         qkv: FloatTensor<Self>,
         beta_g: FloatTensor<Self>,
         state: FloatTensor<Self>,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>);
+
+    #[fusion(meta=|input: &TensorSpec, _state: &TensorSpec, _weight: &TensorSpec| {
+        let [_, channels, _] = input.shape.dims::<3>();
+        (
+            TensorSpec::new(Shape::from([1, channels, 1]), DType::F32),
+            TensorSpec::new(Shape::from([1, channels, 3]), DType::F32),
+        )
+    })]
+    fn depthwise_conv_silu_update(
+        input: FloatTensor<Self>,
+        state: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
     ) -> (FloatTensor<Self>, FloatTensor<Self>);
 }
 
@@ -972,6 +1012,42 @@ impl CustomKernels for CubeBackend {
         );
         (out, new_state)
     }
+
+    fn depthwise_conv_silu_update(
+        input: FloatTensor<Self>,
+        state: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        let client = input.client.clone();
+        let device = input.device.clone();
+        let [batch, channels, seq_len] = input.shape().dims::<3>();
+        let [state_batch, state_channels, state_len] = state.shape().dims::<3>();
+        let [weight_channels, kernel] = weight.shape().dims::<2>();
+        assert_eq!(batch, 1);
+        assert_eq!(seq_len, 1);
+        assert_eq!(state_batch, 1);
+        assert_eq!(state_channels, channels);
+        assert_eq!(state_len, 3);
+        assert_eq!(weight_channels, channels);
+        assert_eq!(kernel, 4);
+
+        let out = Self::float_empty(Shape::from([1, channels, 1]), &device, FloatDType::F32);
+        let new_state = Self::float_empty(Shape::from([1, channels, 3]), &device, FloatDType::F32);
+        let cube_dim = CubeDim::new_3d(256, 1, 1);
+        let cube_count = CubeCount::Static((channels as u32).div_ceil(cube_dim.x), 1, 1);
+        depthwise_conv_silu_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            input.into_tensor_arg(),
+            state.into_tensor_arg(),
+            weight.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            new_state.clone().into_tensor_arg(),
+            channels as u32,
+        );
+        (out, new_state)
+    }
 }
 
 /// embeddings: (vocab_size, emb_dim)
@@ -1057,6 +1133,27 @@ pub fn rms_norm_gated(
     burn::Tensor::<2>::from_dispatch(out).reshape(dims)
 }
 
+/// Depthwise conv update for one new token, kernel size 4, followed by SiLU.
+/// Inputs are made contiguous first; a sliced conv state is not row-major.
+pub fn depthwise_conv_silu_update(
+    input: burn::Tensor<3>,
+    state: burn::Tensor<3>,
+    weight: burn::Tensor<2>,
+) -> (burn::Tensor<3>, burn::Tensor<3>) {
+    let input = materialize(input);
+    let state = materialize(state);
+    let weight = materialize(weight);
+    let (out, new_state) = <Dispatch as CustomKernels>::depthwise_conv_silu_update(
+        input.into_dispatch(),
+        state.into_dispatch(),
+        weight.into_dispatch(),
+    );
+    (
+        burn::Tensor::<3>::from_dispatch(out),
+        burn::Tensor::<3>::from_dispatch(new_state),
+    )
+}
+
 pub fn gate_proj_raw(
     hidden_states: burn::Tensor<3>,
     w_b: burn::Tensor<2>,
@@ -1131,12 +1228,17 @@ mod tests {
     use burn::tensor::{
         Device, Distribution, Tensor,
         activation::silu,
+        module::conv1d,
+        ops::ConvOptions,
         quantization::{QuantScheme, ScaleDtype},
         s,
     };
     use cubecl::quant::scheme::QuantValue;
 
-    use super::{q8_gemv, q8_gemv_partial_sum, q8_lm_head, rms_norm, rms_norm_gated};
+    use super::{
+        depthwise_conv_silu_update, q8_gemv, q8_gemv_partial_sum, q8_lm_head, rms_norm,
+        rms_norm_gated,
+    };
 
     fn max_abs(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
@@ -1254,5 +1356,38 @@ mod tests {
             &reference.into_data().try_to_vec::<f32>().unwrap(),
         );
         assert!(diff < 1e-4, "gated rmsnorm diff {diff}");
+    }
+
+    #[test]
+    fn depthwise_conv_update_matches_burn() {
+        let device = Device::wgpu(Default::default());
+        for channels in [17usize, 64] {
+            let history =
+                Tensor::<3>::random([1, channels, 6], Distribution::Uniform(-1.0, 1.0), &device);
+            let state = history.slice(s![.., .., 3..6]);
+            let input =
+                Tensor::<3>::random([1, channels, 1], Distribution::Uniform(-1.0, 1.0), &device);
+            let weight =
+                Tensor::<2>::random([channels, 4], Distribution::Uniform(-0.5, 0.5), &device);
+            let window = Tensor::cat(vec![state.clone(), input.clone()], 2);
+            let reference = silu(conv1d(
+                window.clone(),
+                weight.clone().unsqueeze_dim::<3>(1),
+                None,
+                ConvOptions::new([1], [0], [1], channels),
+            ));
+            let reference_state = window.slice(s![.., .., -3..]);
+            let (got, got_state) = depthwise_conv_silu_update(input, state, weight);
+            let diff = max_abs(
+                &got.into_data().try_to_vec::<f32>().unwrap(),
+                &reference.into_data().try_to_vec::<f32>().unwrap(),
+            );
+            let state_diff = max_abs(
+                &got_state.into_data().try_to_vec::<f32>().unwrap(),
+                &reference_state.into_data().try_to_vec::<f32>().unwrap(),
+            );
+            assert!(diff < 1e-4, "conv diff {diff}");
+            assert!(state_diff < 1e-5, "conv state diff {state_diff}");
+        }
     }
 }

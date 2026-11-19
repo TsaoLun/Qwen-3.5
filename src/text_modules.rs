@@ -141,8 +141,17 @@ fn causal_conv1d_update(
     // weight: (channels, kernel_size)
     // bias: (channels,)
 
-    let [_, channels, seq_len] = hidden_states.dims();
+    let [batch, channels, seq_len] = hidden_states.dims();
     let state_len = conv_state.dims()[2];
+    if bias.is_none()
+        && batch == 1
+        && seq_len == 1
+        && state_len == 3
+        && conv_state.dims() == [1, channels, 3]
+        && weight.dims() == [channels, 4]
+    {
+        return kernels::depthwise_conv_silu_update(hidden_states, conv_state, weight);
+    }
 
     let hidden_states_new = Tensor::cat(vec![conv_state, hidden_states], 2); // (B, channels, seq_len + state_len)
     let conv_state = hidden_states_new
