@@ -432,6 +432,16 @@ pub trait CustomKernels: Backend {
     ) -> IntTensor<Self>;
 }
 
+/// Keep the upstream split target, then step down until every K row is covered by the
+/// 8-wide unroll. `2048 / 12` would otherwise drop the tail of a 2048-wide projection.
+fn gemv_splits(in_dim: usize, out_dim: usize) -> usize {
+    let mut splits = (25_000 / out_dim).clamp(1, (in_dim / 80).max(1));
+    while splits > 1 && (in_dim % splits != 0 || (in_dim / splits) % 8 != 0) {
+        splits -= 1;
+    }
+    splits
+}
+
 impl CustomKernels for CubeBackend {
     fn q8_embedding_lookup(
         table: QuantizedTensor<Self>,
@@ -501,7 +511,11 @@ impl CustomKernels for CubeBackend {
         let device = values.device.clone();
 
         let [in_dim, out_dim] = weights.shape().dims::<2>();
-        let num_splits = (25_000 / out_dim).clamp(1, (in_dim / 80).max(1));
+        assert!(
+            in_dim % 8 == 0,
+            "Q8 GEMV needs in_dim % 8 == 0, got {in_dim}x{out_dim}"
+        );
+        let num_splits = gemv_splits(in_dim, out_dim);
         // Partial sum output
         let output =
             Self::float_empty(Shape::from([num_splits, out_dim]), &device, FloatDType::F32);
@@ -736,4 +750,58 @@ pub fn argmax(logits: burn::Tensor<1>) -> burn::Tensor<1, burn::tensor::Int> {
     let index = <Dispatch as CustomKernels>::argmax_final(partial, partial_indices);
     let out = burn::Tensor::<1, burn::tensor::Int>::from_dispatch(index);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::tensor::{
+        Device, Distribution, Tensor,
+        quantization::{QuantScheme, ScaleDtype},
+    };
+    use cubecl::quant::scheme::QuantValue;
+
+    use super::{q8_gemv, q8_gemv_partial_sum};
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+    }
+
+    fn scheme() -> QuantScheme {
+        QuantScheme::default()
+            .per_block([64], ScaleDtype::F32)
+            .with_value(QuantValue::Q8F)
+    }
+
+    #[test]
+    fn gemv_matches_dequantized_matmul() {
+        let device = Device::wgpu(Default::default());
+        let scheme = scheme();
+        // Every decode projection shape of Qwen3.5-2B, plus a small one.
+        for (in_dim, out_dim) in [
+            (128usize, 256usize),
+            (2048, 512),
+            (2048, 2048),
+            (2048, 4096),
+            (2048, 6144),
+            (6144, 2048),
+        ] {
+            let weight =
+                Tensor::<2>::random([in_dim, out_dim], Distribution::Uniform(-0.5, 0.5), &device)
+                    .quantize_dynamic(&scheme);
+            let x = Tensor::<3>::random([1, 1, in_dim], Distribution::Uniform(-1.0, 1.0), &device);
+            let reference = x
+                .clone()
+                .matmul(weight.clone().dequantize().unsqueeze_dim::<3>(0));
+            let reference = reference.into_data().try_to_vec::<f32>().unwrap();
+            for (name, got) in [
+                ("gemv", q8_gemv(x.clone(), weight.clone())),
+                ("partial", q8_gemv_partial_sum(x, weight)),
+            ] {
+                let diff = max_abs(&got.into_data().try_to_vec::<f32>().unwrap(), &reference);
+                assert!(diff < 1e-2, "{name} {in_dim}x{out_dim} diff {diff}");
+            }
+        }
+    }
 }
