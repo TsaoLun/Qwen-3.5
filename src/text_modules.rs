@@ -90,13 +90,12 @@ pub struct RMSNormGated {
 
 impl RMSNormGated {
     pub fn forward(&self, hidden_states: Tensor<3>, gate: Tensor<3>) -> Tensor<3> {
-        // hidden_states: (B, T, hidden_size)
-        // gate: (B, T, hidden_size)
-        let variance = hidden_states.clone().square().mean_dim(2); // (B, T, 1)
-        let hidden_states = hidden_states * (variance + self.variance_epsilon).sqrt().recip(); // (B, T, hidden_size)
-        let weight = self.weight.val().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, hidden_size)
-        let hidden_states = weight * hidden_states; // (B, T, hidden_size)
-        hidden_states * silu(gate) // (B, T, hidden_size)
+        kernels::rms_norm_gated(
+            hidden_states,
+            gate,
+            self.weight.val(),
+            self.variance_epsilon,
+        )
     }
 }
 
@@ -799,12 +798,7 @@ pub struct RMSNorm {
 
 impl RMSNorm {
     pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
-        let output = x.clone() * (x.square().mean_dim(D - 1) + self.eps).sqrt().recip();
-        let mut weight_shape = [1; D];
-        weight_shape[D - 1] = self.weight.dims()[0];
-
-        let output = output * (1.0 + self.weight.val().reshape(weight_shape));
-        output
+        kernels::rms_norm(x, self.weight.val(), self.eps)
     }
 }
 

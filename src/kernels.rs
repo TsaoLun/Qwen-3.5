@@ -402,6 +402,101 @@ fn argmax_final(
     }
 }
 
+/// Row-wise RMSNorm. `plus_one` matches `RMSNorm` (`(1 + weight)`); otherwise the weight is the
+/// scale itself. `gated` multiplies by `silu(gate)` after the norm.
+#[cube(launch)]
+fn rmsnorm_kernel(
+    x: &Tensor<f32>,      // [rows, dim], contiguous
+    gate: &Tensor<f32>,   // same shape, read only when gated
+    weight: &Tensor<f32>, // [dim]
+    out: &mut Tensor<f32>,
+    eps: f32,
+    rows: u32,
+    row_stride: u32,
+    #[comptime] dim: usize,
+    #[comptime] gated: bool,
+    #[comptime] plus_one: bool,
+) {
+    let mut smem = Shared::<[f32]>::new_slice(256usize);
+    let tid = usize::cast_from(UNIT_POS);
+    let mut row = CUBE_POS_X;
+    while row < rows {
+        let row_us = usize::cast_from(row);
+        let mut local = 0.0f32;
+        let steps = (dim + 255) / 256;
+        for step in 0..steps {
+            let idx = tid + step * 256;
+            if idx < dim {
+                let v = x[row_us * dim + idx];
+                local += v * v;
+            }
+        }
+        smem[tid] = local;
+        sync_cube();
+        if tid < 128 {
+            let sum = smem[tid] + smem[tid + 128];
+            smem[tid] = sum;
+        }
+        sync_cube();
+        if tid < 64 {
+            let sum = smem[tid] + smem[tid + 64];
+            smem[tid] = sum;
+        }
+        sync_cube();
+        if tid < 32 {
+            let sum = smem[tid] + smem[tid + 32];
+            smem[tid] = sum;
+        }
+        sync_cube();
+        if tid < 16 {
+            let sum = smem[tid] + smem[tid + 16];
+            smem[tid] = sum;
+        }
+        sync_cube();
+        if tid < 8 {
+            let sum = smem[tid] + smem[tid + 8];
+            smem[tid] = sum;
+        }
+        sync_cube();
+        if tid < 4 {
+            let sum = smem[tid] + smem[tid + 4];
+            smem[tid] = sum;
+        }
+        sync_cube();
+        if tid < 2 {
+            let sum = smem[tid] + smem[tid + 2];
+            smem[tid] = sum;
+        }
+        sync_cube();
+        if tid < 1 {
+            let sum = smem[tid] + smem[tid + 1];
+            smem[tid] = sum;
+        }
+        sync_cube();
+        let inv = (smem[0] / f32::cast_from(dim) + eps).sqrt().recip();
+        // The next row overwrites smem[0]; wait until every unit has read it.
+        sync_cube();
+        for step in 0..steps {
+            let idx = tid + step * 256;
+            if idx < dim {
+                let v = x[row_us * dim + idx];
+                let scale = if comptime!(plus_one) {
+                    1.0 + weight[idx]
+                } else {
+                    weight[idx]
+                };
+                let mut y = v * inv * scale;
+                if comptime!(gated) {
+                    let g = gate[row_us * dim + idx];
+                    y *= g / (1.0 + (-g).exp());
+                }
+                out[row_us * dim + idx] = y;
+            }
+        }
+        row += row_stride;
+    }
+}
+
 #[backend_extension(Cube, Fusion)]
 pub trait CustomKernels: Backend {
     #[fusion(meta=|table: &TensorSpec, ids: &TensorSpec| {
@@ -462,6 +557,17 @@ pub trait CustomKernels: Backend {
         partial: FloatTensor<Self>,
         partial_indices: IntTensor<Self>,
     ) -> IntTensor<Self>;
+
+    #[fusion(meta=|x: &TensorSpec, _weight: &TensorSpec, _eps: &f32| { x.clone() })]
+    fn rms_norm(x: FloatTensor<Self>, weight: FloatTensor<Self>, eps: f32) -> FloatTensor<Self>;
+
+    #[fusion(meta=|x: &TensorSpec, _gate: &TensorSpec, _weight: &TensorSpec, _eps: &f32| { x.clone() })]
+    fn rms_norm_gated(
+        x: FloatTensor<Self>,
+        gate: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+        eps: f32,
+    ) -> FloatTensor<Self>;
 }
 
 /// Keep the upstream split target, then step down until every K row is covered by the
@@ -472,6 +578,44 @@ fn gemv_splits(in_dim: usize, out_dim: usize) -> usize {
         splits -= 1;
     }
     splits
+}
+
+fn launch_rmsnorm<const GATED: bool, const PLUS_ONE: bool>(
+    x: FloatTensor<CubeBackend>,
+    gate: Option<FloatTensor<CubeBackend>>,
+    weight: FloatTensor<CubeBackend>,
+    eps: f32,
+) -> FloatTensor<CubeBackend> {
+    let client = x.client.clone();
+    let device = x.device.clone();
+    let [rows, dim] = x.shape().dims::<2>();
+    let [weight_dim] = weight.shape().dims::<1>();
+    assert_eq!(
+        weight_dim, dim,
+        "rmsnorm weight length {weight_dim} != {dim}"
+    );
+    let output = CubeBackend::float_empty(Shape::from([rows, dim]), &device, FloatDType::F32);
+    if rows == 0 {
+        return output;
+    }
+    let gate = gate.unwrap_or_else(|| x.clone());
+    let cubes = u32::try_from(rows.min(2048)).unwrap();
+    rmsnorm_kernel::launch(
+        &client,
+        CubeCount::Static(cubes, 1, 1),
+        CubeDim::new_3d(256, 1, 1),
+        x.into_tensor_arg(),
+        gate.into_tensor_arg(),
+        weight.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        eps,
+        u32::try_from(rows).unwrap(),
+        cubes,
+        dim,
+        GATED,
+        PLUS_ONE,
+    );
+    output
 }
 
 impl CustomKernels for CubeBackend {
@@ -708,6 +852,19 @@ impl CustomKernels for CubeBackend {
         );
         output
     }
+
+    fn rms_norm(x: FloatTensor<Self>, weight: FloatTensor<Self>, eps: f32) -> FloatTensor<Self> {
+        launch_rmsnorm::<false, true>(x, None, weight, eps)
+    }
+
+    fn rms_norm_gated(
+        x: FloatTensor<Self>,
+        gate: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+        eps: f32,
+    ) -> FloatTensor<Self> {
+        launch_rmsnorm::<true, false>(x, Some(gate), weight, eps)
+    }
 }
 
 /// embeddings: (vocab_size, emb_dim)
@@ -747,6 +904,50 @@ pub fn q8_gemv_partial_sum(
     );
     let out = burn::Tensor::<1>::from_dispatch(out).unsqueeze_dims::<3>(&[0, 1]);
     out
+}
+
+/// Kernels index their inputs as row-major; a sliced or permuted view is not.
+fn materialize<const D: usize>(tensor: burn::Tensor<D>) -> burn::Tensor<D> {
+    let dims = tensor.dims();
+    let n = dims.iter().product::<usize>();
+    tensor.reshape([n]).reshape(dims)
+}
+
+/// Normalize over the last axis. Matches `RMSNorm`: scale is `(1 + weight)`.
+pub fn rms_norm<const D: usize>(
+    x: burn::Tensor<D>,
+    weight: burn::Tensor<1>,
+    eps: f32,
+) -> burn::Tensor<D> {
+    let dims = x.dims();
+    let dim = dims[D - 1];
+    let rows = dims.iter().product::<usize>() / dim;
+    let flat = materialize(x).reshape([rows, dim]);
+    let out =
+        <Dispatch as CustomKernels>::rms_norm(flat.into_dispatch(), weight.into_dispatch(), eps);
+    burn::Tensor::<2>::from_dispatch(out).reshape(dims)
+}
+
+/// RMSNorm without the `1 +` on the weight, then `silu(gate)`.
+pub fn rms_norm_gated(
+    x: burn::Tensor<3>,
+    gate: burn::Tensor<3>,
+    weight: burn::Tensor<1>,
+    eps: f32,
+) -> burn::Tensor<3> {
+    let dims = x.dims();
+    assert_eq!(gate.dims(), dims);
+    let dim = dims[2];
+    let rows = dims[0] * dims[1];
+    let flat_x = materialize(x).reshape([rows, dim]);
+    let flat_gate = materialize(gate).reshape([rows, dim]);
+    let out = <Dispatch as CustomKernels>::rms_norm_gated(
+        flat_x.into_dispatch(),
+        flat_gate.into_dispatch(),
+        weight.into_dispatch(),
+        eps,
+    );
+    burn::Tensor::<2>::from_dispatch(out).reshape(dims)
 }
 
 pub fn gate_proj(
@@ -792,11 +993,13 @@ pub fn argmax(logits: burn::Tensor<1>) -> burn::Tensor<1, burn::tensor::Int> {
 mod tests {
     use burn::tensor::{
         Device, Distribution, Tensor,
+        activation::silu,
         quantization::{QuantScheme, ScaleDtype},
+        s,
     };
     use cubecl::quant::scheme::QuantValue;
 
-    use super::{q8_gemv, q8_gemv_partial_sum, q8_lm_head};
+    use super::{q8_gemv, q8_gemv_partial_sum, q8_lm_head, rms_norm, rms_norm_gated};
 
     fn max_abs(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
@@ -863,5 +1066,56 @@ mod tests {
             &reference.into_data().try_to_vec::<f32>().unwrap(),
         );
         assert!(diff < 1e-2, "lm_head diff {diff}");
+    }
+
+    #[test]
+    fn rmsnorm_matches_burn_formula() {
+        let device = Device::wgpu(Default::default());
+        // 5000 rows: cubes loop over more than one row.
+        for (rows, dim) in [(1usize, 2048usize), (4, 256), (3, 32), (5000, 32)] {
+            let x = Tensor::<2>::random([rows, dim], Distribution::Uniform(-1.0, 1.0), &device);
+            let weight = Tensor::<1>::random([dim], Distribution::Uniform(-0.25, 0.25), &device);
+            let eps = 1e-6;
+            let reference = x.clone()
+                * (x.clone().square().mean_dim(1) + eps).sqrt().recip()
+                * (weight.clone() + 1.0).unsqueeze_dim::<2>(0);
+            let got = rms_norm(x, weight, eps);
+            let diff = max_abs(
+                &got.into_data().try_to_vec::<f32>().unwrap(),
+                &reference.into_data().try_to_vec::<f32>().unwrap(),
+            );
+            assert!(diff < 1e-4, "rmsnorm {rows}x{dim} diff {diff}");
+        }
+
+        let wide = Tensor::<2>::random([4, 64], Distribution::Uniform(-1.0, 1.0), &device);
+        let x = wide.slice(s![.., 0..32]);
+        let weight = Tensor::<1>::random([32], Distribution::Uniform(-0.25, 0.25), &device);
+        let eps = 1e-6;
+        let reference = x.clone()
+            * (x.clone().square().mean_dim(1) + eps).sqrt().recip()
+            * (weight.clone() + 1.0).unsqueeze_dim::<2>(0);
+        let got = rms_norm(x, weight, eps);
+        let diff = max_abs(
+            &got.into_data().try_to_vec::<f32>().unwrap(),
+            &reference.into_data().try_to_vec::<f32>().unwrap(),
+        );
+        assert!(diff < 1e-4, "sliced rmsnorm diff {diff}");
+    }
+
+    #[test]
+    fn gated_rmsnorm_matches_burn_formula() {
+        let device = Device::wgpu(Default::default());
+        let x = Tensor::<3>::random([4, 2, 128], Distribution::Uniform(-1.0, 1.0), &device);
+        let gate = Tensor::<3>::random([4, 2, 128], Distribution::Uniform(-1.0, 1.0), &device);
+        let weight = Tensor::<1>::random([128], Distribution::Uniform(0.5, 1.5), &device);
+        let eps = 1e-6;
+        let normed = x.clone() * (x.clone().square().mean_dim(2) + eps).sqrt().recip();
+        let reference = normed * weight.clone().unsqueeze_dims::<3>(&[0, 1]) * silu(gate.clone());
+        let got = rms_norm_gated(x, gate, weight, eps);
+        let diff = max_abs(
+            &got.into_data().try_to_vec::<f32>().unwrap(),
+            &reference.into_data().try_to_vec::<f32>().unwrap(),
+        );
+        assert!(diff < 1e-4, "gated rmsnorm diff {diff}");
     }
 }
