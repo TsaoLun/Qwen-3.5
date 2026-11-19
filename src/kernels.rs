@@ -497,6 +497,73 @@ fn rmsnorm_kernel(
     }
 }
 
+/// One Gated Delta Rule step for a single token.
+///
+/// One cube per head, one unit per value column. `k_dim` must equal `v_dim` and be a power of two.
+/// `state` is contiguous `[1, heads, k_dim, v_dim]`. `beta_g` is `[beta | g]`.
+#[cube(launch)]
+fn gdn_decode_kernel(
+    qkv: &Tensor<f32>,           // [2 * heads * k_dim + heads * v_dim]
+    beta_g: &Tensor<f32>,        // [2 * heads]
+    state: &Tensor<f32>,         // [1, heads, k_dim, v_dim]
+    out: &mut Tensor<f32>,       // [heads * v_dim]
+    new_state: &mut Tensor<f32>, // [1, heads, k_dim, v_dim]
+    #[comptime] num_heads: usize,
+    #[comptime] k_dim: usize,
+    #[comptime] v_dim: usize,
+) {
+    let head = usize::cast_from(CUBE_POS_X);
+    let j = usize::cast_from(UNIT_POS);
+
+    let mut q_s = Shared::<[f32]>::new_slice(k_dim);
+    let mut k_s = Shared::<[f32]>::new_slice(k_dim);
+    let mut red = Shared::<[f32]>::new_slice(k_dim);
+
+    let key_dim = num_heads * k_dim;
+    q_s[j] = qkv[head * k_dim + j];
+    k_s[j] = qkv[key_dim + head * k_dim + j];
+    sync_cube();
+
+    // 128 adds. Serial on one unit so every unit agrees on the norm.
+    if j == 0 {
+        let mut sum_q = 0.0f32;
+        let mut sum_k = 0.0f32;
+        for i in 0..k_dim {
+            sum_q += q_s[i] * q_s[i];
+            sum_k += k_s[i] * k_s[i];
+        }
+        red[0] = (sum_q + 1e-6).sqrt().recip();
+        red[1] = (sum_k + 1e-6).sqrt().recip();
+    }
+    sync_cube();
+    let inv_q = red[0];
+    let inv_k = red[1];
+    let scale = f32::cast_from(k_dim).powf(-0.5);
+
+    q_s[j] = q_s[j] * inv_q * scale;
+    k_s[j] = k_s[j] * inv_k;
+    sync_cube();
+
+    let beta = beta_g[head];
+    let decay = beta_g[num_heads + head].exp();
+    let v = qkv[key_dim * 2 + head * v_dim + j];
+
+    let mut kv = 0.0f32;
+    for i in 0..k_dim {
+        let s = state[(head * k_dim + i) * v_dim + j] * decay;
+        kv += s * k_s[i];
+    }
+    let delta = (v - kv) * beta;
+
+    let mut acc = 0.0f32;
+    for i in 0..k_dim {
+        let s = state[(head * k_dim + i) * v_dim + j] * decay + k_s[i] * delta;
+        new_state[(head * k_dim + i) * v_dim + j] = s;
+        acc += s * q_s[i];
+    }
+    out[head * v_dim + j] = acc;
+}
+
 #[backend_extension(Cube, Fusion)]
 pub trait CustomKernels: Backend {
     #[fusion(meta=|table: &TensorSpec, ids: &TensorSpec| {
@@ -568,6 +635,19 @@ pub trait CustomKernels: Backend {
         weight: FloatTensor<Self>,
         eps: f32,
     ) -> FloatTensor<Self>;
+
+    #[fusion(meta=|_qkv: &TensorSpec, _beta_g: &TensorSpec, state: &TensorSpec| {
+        let [_, num_heads, _, v_dim] = state.shape.dims::<4>();
+        (
+            TensorSpec::new(Shape::from([num_heads * v_dim]), DType::F32),
+            state.clone(),
+        )
+    })]
+    fn gdn_decode(
+        qkv: FloatTensor<Self>,
+        beta_g: FloatTensor<Self>,
+        state: FloatTensor<Self>,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>);
 }
 
 /// Keep the upstream split target, then step down until every K row is covered by the
@@ -865,6 +945,33 @@ impl CustomKernels for CubeBackend {
     ) -> FloatTensor<Self> {
         launch_rmsnorm::<true, false>(x, Some(gate), weight, eps)
     }
+
+    fn gdn_decode(
+        qkv: FloatTensor<Self>,
+        beta_g: FloatTensor<Self>,
+        state: FloatTensor<Self>,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        let client = qkv.client.clone();
+        let device = qkv.device.clone();
+        let [_, num_heads, k_dim, v_dim] = state.shape().dims::<4>();
+        let out = Self::float_empty(Shape::from([num_heads * v_dim]), &device, FloatDType::F32);
+        let new_state = Self::float_empty(state.shape(), &device, FloatDType::F32);
+
+        gdn_decode_kernel::launch(
+            &client,
+            CubeCount::Static(num_heads as u32, 1, 1),
+            CubeDim::new_3d(v_dim as u32, 1, 1),
+            qkv.into_tensor_arg(),
+            beta_g.into_tensor_arg(),
+            state.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            new_state.clone().into_tensor_arg(),
+            num_heads,
+            k_dim,
+            v_dim,
+        );
+        (out, new_state)
+    }
 }
 
 /// embeddings: (vocab_size, emb_dim)
@@ -950,13 +1057,13 @@ pub fn rms_norm_gated(
     burn::Tensor::<2>::from_dispatch(out).reshape(dims)
 }
 
-pub fn gate_proj(
+pub fn gate_proj_raw(
     hidden_states: burn::Tensor<3>,
     w_b: burn::Tensor<2>,
     w_a: burn::Tensor<2>,
     a_log: burn::Tensor<1>,
     dt_bias: burn::Tensor<1>,
-) -> (burn::Tensor<3>, burn::Tensor<3>) {
+) -> burn::Tensor<1> {
     let out = <Dispatch as CustomKernels>::gate_proj(
         hidden_states.squeeze_dims::<1>(&[0, 1]).into_dispatch(),
         w_b.into_dispatch(),
@@ -964,7 +1071,37 @@ pub fn gate_proj(
         a_log.into_dispatch(),
         dt_bias.into_dispatch(),
     );
-    let out = burn::Tensor::<1>::from_dispatch(out);
+    burn::Tensor::<1>::from_dispatch(out)
+}
+
+/// One decode step of Gated DeltaNet. `beta_g` is the raw `gate_proj` output
+/// (`[beta | g]`, length `2 * heads`). State is `[1, heads, k_dim, v_dim]`.
+pub fn gdn_decode(
+    qkv: burn::Tensor<3>,
+    beta_g: burn::Tensor<1>,
+    state: burn::Tensor<4>,
+) -> (burn::Tensor<3>, burn::Tensor<4>) {
+    let qkv = materialize(qkv);
+    let state = materialize(state);
+    let (out, new_state) = <Dispatch as CustomKernels>::gdn_decode(
+        qkv.squeeze_dims::<1>(&[0, 1]).into_dispatch(),
+        beta_g.into_dispatch(),
+        state.into_dispatch(),
+    );
+    (
+        burn::Tensor::<1>::from_dispatch(out).unsqueeze_dims::<3>(&[0, 1]),
+        burn::Tensor::<4>::from_dispatch(new_state),
+    )
+}
+
+pub fn gate_proj(
+    hidden_states: burn::Tensor<3>,
+    w_b: burn::Tensor<2>,
+    w_a: burn::Tensor<2>,
+    a_log: burn::Tensor<1>,
+    dt_bias: burn::Tensor<1>,
+) -> (burn::Tensor<3>, burn::Tensor<3>) {
+    let out = gate_proj_raw(hidden_states, w_b, w_a, a_log, dt_bias);
     let beta_gate_vec = out.chunk(2, 0);
     (
         beta_gate_vec[0].clone().unsqueeze_dims::<3>(&[0, 1]),

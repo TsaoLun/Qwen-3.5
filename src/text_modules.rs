@@ -555,100 +555,128 @@ impl GatedDeltaNet {
         let key_dim = self.num_k_heads * self.head_k_dim;
         let value_dim = self.num_v_heads * self.head_v_dim;
 
-        let query = mixed_qkv.clone().slice(s![.., .., 0..key_dim]);
-        let key = mixed_qkv.clone().slice(s![.., .., key_dim..(key_dim * 2)]);
-        let value = mixed_qkv
-            .clone()
-            .slice(s![.., .., (key_dim * 2)..(key_dim * 2 + value_dim)]);
+        // One launch per linear layer instead of the slice / l2norm / delta-rule op chain.
+        // Requires equal head counts and a power-of-two head dim (true for Qwen3.5-2B).
+        let use_gdn_kernel = use_precomputed_states
+            && seq_len == 1
+            && self.num_k_heads == self.num_v_heads
+            && self.head_k_dim == self.head_v_dim
+            && self.head_k_dim.is_power_of_two();
 
-        let mut query = query.reshape([batch_size, seq_len, self.num_k_heads, self.head_k_dim]);
-        let mut key = key.reshape([batch_size, seq_len, self.num_k_heads, self.head_k_dim]);
-        let value = value.reshape([batch_size, seq_len, self.num_v_heads, self.head_v_dim]);
-
-        let (beta, g) = if seq_len == 1 {
-            kernels::gate_proj(
-                hidden_states.clone(),
+        let core_attn_out = if use_gdn_kernel {
+            let beta_g = kernels::gate_proj_raw(
+                hidden_states,
                 self.in_proj_b.weight.val(),
                 self.in_proj_a.weight.val(),
                 self.a_log.val(),
                 self.dt_bias.val(),
-            )
-        } else {
-            let b = self.in_proj_b.forward(hidden_states.clone());
-            let a = self.in_proj_a.forward(hidden_states.clone());
-
-            let beta = sigmoid(b);
-
-            let a_log_exp = self.a_log.val().exp().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
-            let dt_bias = self.dt_bias.val().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
-            // let softplus = (a + dt_bias).exp().add_scalar(1.0).log();
-            let x_gate = a + dt_bias;
-            let softplus = x_gate
+            );
+            let state = cache.as_ref().unwrap().recurrent_states[self.layer_idx]
                 .clone()
-                .exp()
-                .add_scalar(1.0)
-                .log()
-                .mask_where(x_gate.clone().greater_elem(20.0), x_gate);
-
-            let g = -a_log_exp * softplus;
-            (beta, g)
-        };
-
-        if self.num_v_heads / self.num_k_heads > 1 {
-            let repeat_factor = self.num_v_heads / self.num_k_heads;
-
-            let expanded_shape = [
-                batch_size,
-                seq_len,
-                self.num_k_heads,
-                repeat_factor,
-                self.head_k_dim,
-            ];
-            let interleaved_shape = [batch_size, seq_len, self.num_v_heads, self.head_k_dim];
-            query = query
-                .unsqueeze_dim::<5>(3)
-                .expand(expanded_shape)
-                .reshape(interleaved_shape);
-            key = key
-                .unsqueeze_dim::<5>(3)
-                .expand(expanded_shape)
-                .reshape(interleaved_shape);
-        }
-
-        let recurrent_state = if use_precomputed_states {
-            cache.as_ref().unwrap().recurrent_states[self.layer_idx].clone()
+                .unwrap();
+            let (out, new_state) = kernels::gdn_decode(mixed_qkv, beta_g, state);
+            if let Some(c) = cache.as_mut() {
+                c.recurrent_states[self.layer_idx] = Some(new_state);
+            }
+            out.reshape([batch_size, seq_len, self.num_v_heads, self.head_v_dim])
         } else {
-            None
+            let query = mixed_qkv.clone().slice(s![.., .., 0..key_dim]);
+            let key = mixed_qkv.clone().slice(s![.., .., key_dim..(key_dim * 2)]);
+            let value =
+                mixed_qkv
+                    .clone()
+                    .slice(s![.., .., (key_dim * 2)..(key_dim * 2 + value_dim)]);
+
+            let mut query = query.reshape([batch_size, seq_len, self.num_k_heads, self.head_k_dim]);
+            let mut key = key.reshape([batch_size, seq_len, self.num_k_heads, self.head_k_dim]);
+            let value = value.reshape([batch_size, seq_len, self.num_v_heads, self.head_v_dim]);
+
+            let (beta, g) = if seq_len == 1 {
+                kernels::gate_proj(
+                    hidden_states.clone(),
+                    self.in_proj_b.weight.val(),
+                    self.in_proj_a.weight.val(),
+                    self.a_log.val(),
+                    self.dt_bias.val(),
+                )
+            } else {
+                let b = self.in_proj_b.forward(hidden_states.clone());
+                let a = self.in_proj_a.forward(hidden_states.clone());
+
+                let beta = sigmoid(b);
+
+                let a_log_exp = self.a_log.val().exp().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
+                let dt_bias = self.dt_bias.val().unsqueeze_dims::<3>(&[0, 1]); // (1, 1, num_v_heads)
+                // let softplus = (a + dt_bias).exp().add_scalar(1.0).log();
+                let x_gate = a + dt_bias;
+                let softplus = x_gate
+                    .clone()
+                    .exp()
+                    .add_scalar(1.0)
+                    .log()
+                    .mask_where(x_gate.clone().greater_elem(20.0), x_gate);
+
+                let g = -a_log_exp * softplus;
+                (beta, g)
+            };
+
+            if self.num_v_heads / self.num_k_heads > 1 {
+                let repeat_factor = self.num_v_heads / self.num_k_heads;
+
+                let expanded_shape = [
+                    batch_size,
+                    seq_len,
+                    self.num_k_heads,
+                    repeat_factor,
+                    self.head_k_dim,
+                ];
+                let interleaved_shape = [batch_size, seq_len, self.num_v_heads, self.head_k_dim];
+                query = query
+                    .unsqueeze_dim::<5>(3)
+                    .expand(expanded_shape)
+                    .reshape(interleaved_shape);
+                key = key
+                    .unsqueeze_dim::<5>(3)
+                    .expand(expanded_shape)
+                    .reshape(interleaved_shape);
+            }
+
+            let recurrent_state = if use_precomputed_states {
+                cache.as_ref().unwrap().recurrent_states[self.layer_idx].clone()
+            } else {
+                None
+            };
+
+            let output_final_state = cache.is_some();
+
+            let (core_attn_out, last_recurrent_state) = if use_precomputed_states && seq_len == 1 {
+                burn_recurrent_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    recurrent_state,
+                    output_final_state,
+                )
+            } else {
+                burn_chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    64,
+                    recurrent_state,
+                    output_final_state,
+                )
+            };
+
+            if let Some(c) = cache {
+                c.recurrent_states[self.layer_idx] = last_recurrent_state;
+            }
+            core_attn_out
         };
-
-        let output_final_state = cache.is_some();
-
-        let (core_attn_out, last_recurrent_state) = if use_precomputed_states && seq_len == 1 {
-            burn_recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                recurrent_state,
-                output_final_state,
-            )
-        } else {
-            burn_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                64,
-                recurrent_state,
-                output_final_state,
-            )
-        };
-
-        if let Some(c) = cache {
-            c.recurrent_states[self.layer_idx] = last_recurrent_state;
-        }
 
         let num_elements = batch_size * seq_len * self.num_v_heads;
         let core_attn_out = core_attn_out.reshape([num_elements, self.head_v_dim]);
@@ -1108,6 +1136,69 @@ impl DecoderLayerConfig {
             mlp,
             input_layernorm,
             post_attention_layernorm,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::tensor::{Device, Distribution, Tensor};
+
+    use super::burn_recurrent_gated_delta_rule;
+    use crate::kernels;
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+    }
+
+    fn to_vec<const D: usize>(t: Tensor<D>) -> Vec<f32> {
+        t.into_data().try_to_vec::<f32>().unwrap()
+    }
+
+    #[test]
+    fn gdn_decode_matches_reference() {
+        let device = Device::wgpu(Default::default());
+        for (heads, dim) in [(2usize, 32usize), (16, 128)] {
+            let shape = [1, 1, heads, dim];
+            let q = Tensor::<4>::random(shape, Distribution::Uniform(-1.0, 1.0), &device);
+            let k = Tensor::<4>::random(shape, Distribution::Uniform(-1.0, 1.0), &device);
+            let v = Tensor::<4>::random(shape, Distribution::Uniform(-1.0, 1.0), &device);
+            let beta =
+                Tensor::<3>::random([1, 1, heads], Distribution::Uniform(0.05, 1.0), &device);
+            let g = Tensor::<3>::random([1, 1, heads], Distribution::Uniform(-1.5, -0.05), &device);
+            let state = Tensor::<4>::random(
+                [1, heads, dim, dim],
+                Distribution::Uniform(-0.5, 0.5),
+                &device,
+            );
+
+            let (ref_out, ref_state) = burn_recurrent_gated_delta_rule(
+                q.clone(),
+                k.clone(),
+                v.clone(),
+                g.clone(),
+                beta.clone(),
+                Some(state.clone()),
+                true,
+            );
+
+            let qkv = Tensor::cat(
+                vec![
+                    q.reshape([1, 1, heads * dim]),
+                    k.reshape([1, 1, heads * dim]),
+                    v.reshape([1, 1, heads * dim]),
+                ],
+                2,
+            );
+            let beta_g = Tensor::cat(vec![beta.reshape([heads]), g.reshape([heads])], 0);
+            let (out, new_state) = kernels::gdn_decode(qkv, beta_g, state);
+
+            let d_out = max_abs(&to_vec(out), &to_vec(ref_out.reshape([1, 1, heads * dim])));
+            let d_state = max_abs(&to_vec(new_state), &to_vec(ref_state.unwrap()));
+            assert!(d_out < 2e-3, "output diff {d_out}");
+            assert!(d_state < 2e-3, "state diff {d_state}");
         }
     }
 }
