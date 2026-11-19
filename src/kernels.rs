@@ -246,8 +246,9 @@ fn gate_proj_kernel(
     }
 }
 
-/// This kernel needs to compute dot product with every dim
-/// Will launch vocab_size * 32 units
+/// One row of the LM head. Launch with 256 threads per cube: eight rows, 32 lanes each.
+/// Each lane owns one packed word. The 32-lane sum is done in shared memory: `plane_sum`
+/// spans the whole plane, which is 64 lanes (two rows) on AMD GCN.
 #[cube(launch)]
 fn q8_lm_head_kernel(
     hidden_states: &Tensor<f32>, // [dim]
@@ -256,37 +257,68 @@ fn q8_lm_head_kernel(
     output: &mut Tensor<f32>,    // [vocab_size]
     #[comptime] dim: usize,
 ) {
-    let row = ABSOLUTE_POS / 32; // 32 lanes operate on same row, a plane
-    let lane = ABSOLUTE_POS % 32;
-    if row >= output.len() {
-        terminate!()
-    }
-    let words_per_row = dim / 4;
-    let scales_per_row = dim / 64;
+    let mut smem = Shared::<[f32]>::new_slice(256usize);
+    let local = usize::cast_from(UNIT_POS);
+    let lane = local % 32;
+    let row = usize::cast_from(ABSOLUTE_POS) / 32;
+    // No early exit: every thread has to reach the barriers below.
+    let active = row < output.len();
 
     let mut acc = 0.0f32;
-    // col of embedding matrix
-    // each lane will handle 64 values
-    for k in 0..(dim / 32) {
-        // lane 0 will fetch first row's first address, lane 1 will fetch first row's second address, and so on.
-        // essentially all lanes in the plane will fetch 32 values simultaneously
-        // Then at second iteration of this loop,
-        // lane 0 will fetch first row's 33rd address, lane 1 will fetch first row's 34th address, and so on.
-        // By the end, full row will be complete
-        let col = k * 32 + lane;
-        let word_idx = words_per_row * row + col / 4;
-        let shift = (u32::cast_from(col) % 4) * 8u32;
-        let word = embeddings[word_idx];
-        let raw = (word >> shift) & 255u32;
-        let is_negative = raw >= 128u32;
-        let signed = i32::cast_from(raw) - i32::cast_from(is_negative) * 256;
-        let scale_idx = row * scales_per_row + col / 64;
-        let scale = scales[scale_idx];
-        acc += f32::cast_from(signed) * hidden_states[col] * scale;
+    if active {
+        let words_per_row = dim / 4;
+        let scales_per_row = dim / 64;
+        // 32 lanes cover 128 columns per step: each lane owns one packed word.
+        for k in 0..(dim / 128) {
+            let word_col = k * 32 + lane;
+            let col0 = word_col * 4;
+            let word = embeddings[words_per_row * row + word_col];
+            let scale = scales[row * scales_per_row + col0 / 64];
+            let b0 = (word >> 0u32) & 255u32;
+            let b1 = (word >> 8u32) & 255u32;
+            let b2 = (word >> 16u32) & 255u32;
+            let b3 = (word >> 24u32) & 255u32;
+            let s0 = i32::cast_from(b0) - i32::cast_from(b0 >= 128u32) * 256;
+            let s1 = i32::cast_from(b1) - i32::cast_from(b1 >= 128u32) * 256;
+            let s2 = i32::cast_from(b2) - i32::cast_from(b2 >= 128u32) * 256;
+            let s3 = i32::cast_from(b3) - i32::cast_from(b3 >= 128u32) * 256;
+            acc += (f32::cast_from(s0) * hidden_states[col0]
+                + f32::cast_from(s1) * hidden_states[col0 + 1]
+                + f32::cast_from(s2) * hidden_states[col0 + 2]
+                + f32::cast_from(s3) * hidden_states[col0 + 3])
+                * scale;
+        }
     }
-    let total = plane_sum(acc);
-    if lane == 0 {
-        output[row] = total;
+
+    smem[local] = acc;
+    sync_cube();
+    if lane < 16 {
+        let sum = smem[local] + smem[local + 16];
+        smem[local] = sum;
+    }
+    sync_cube();
+    if lane < 8 {
+        let sum = smem[local] + smem[local + 8];
+        smem[local] = sum;
+    }
+    sync_cube();
+    if lane < 4 {
+        let sum = smem[local] + smem[local + 4];
+        smem[local] = sum;
+    }
+    sync_cube();
+    if lane < 2 {
+        let sum = smem[local] + smem[local + 2];
+        smem[local] = sum;
+    }
+    sync_cube();
+    if lane < 1 {
+        let sum = smem[local] + smem[local + 1];
+        smem[local] = sum;
+    }
+    sync_cube();
+    if lane == 0 && active {
+        output[row] = smem[local];
     }
 }
 
@@ -595,6 +627,10 @@ impl CustomKernels for CubeBackend {
         let client = values.client.clone();
         let device = values.device.clone();
         let [vocab_size, dim] = embeddings.shape().dims::<2>();
+        assert!(
+            dim % 128 == 0,
+            "Q8 LM head needs dim % 128 == 0 so each lane owns whole words, got {dim}"
+        );
         let output = Self::float_empty(Shape::from([vocab_size]), &device, FloatDType::F32);
 
         let num_units = vocab_size * 32;
@@ -760,7 +796,7 @@ mod tests {
     };
     use cubecl::quant::scheme::QuantValue;
 
-    use super::{q8_gemv, q8_gemv_partial_sum};
+    use super::{q8_gemv, q8_gemv_partial_sum, q8_lm_head};
 
     fn max_abs(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
@@ -803,5 +839,29 @@ mod tests {
                 assert!(diff < 1e-2, "{name} {in_dim}x{out_dim} diff {diff}");
             }
         }
+    }
+
+    #[test]
+    fn lm_head_matches_dequantized_matmul() {
+        let device = Device::wgpu(Default::default());
+        // Not a multiple of 8 rows, so the last cube has idle rows.
+        let vocab = 1001usize;
+        let dim = 2048usize;
+        let table = Tensor::<2>::random([vocab, dim], Distribution::Uniform(-0.5, 0.5), &device)
+            .quantize_dynamic(&scheme());
+        let x = Tensor::<3>::random([1, 1, dim], Distribution::Uniform(-1.0, 1.0), &device);
+        let reference = x.clone().matmul(
+            table
+                .clone()
+                .dequantize()
+                .swap_dims(0, 1)
+                .unsqueeze_dim::<3>(0),
+        );
+        let got = q8_lm_head(x, table);
+        let diff = max_abs(
+            &got.into_data().try_to_vec::<f32>().unwrap(),
+            &reference.into_data().try_to_vec::<f32>().unwrap(),
+        );
+        assert!(diff < 1e-2, "lm_head diff {diff}");
     }
 }
